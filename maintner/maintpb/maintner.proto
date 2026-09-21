@@ -128,7 +128,14 @@ message GithubIssueMutation {
   // GitHubIssue.LastModified account for them.
   google.protobuf.Timestamp meta_changed_date = 51;
 
-  // Next tag: 52
+  // issue_field_change records changes to the issue_field values above, with
+  // GitHub's own timestamp for each. Like issue_field, the list is a full
+  // snapshot rather than a delta. issue_field_changes_synced marks the list
+  // authoritative, and the list then replaces whatever was known before.
+  repeated GithubIssueFieldChange issue_field_change = 52;
+  bool issue_field_changes_synced = 53;
+
+  // Next tag: 54
 }
 
 // BoolChange represents a change to a boolean value.
@@ -454,6 +461,21 @@ message GithubProjectItemFieldValue {
 message GithubIssueFieldValue {
   string field_name = 1;   // the issue field's name
   string value = 2;        // the field's display value
+}
+
+// GithubIssueFieldChange records one org-level "Issue field" value being
+// replaced by another. GithubIssueFieldValue holds only the current value. A
+// change record is what tells you when that value was set and what it replaced.
+//
+// A field's first assignment and its clearing are separate GitHub event types
+// and are not recorded here.
+message GithubIssueFieldChange {
+  string id = 1;             // GraphQL node ID
+  string field_name = 2;     // the issue field's name
+  string previous_value = 3; // display value before the change
+  string value = 4;          // display value after the change
+  int64 actor_id = 5;
+  google.protobuf.Timestamp created = 6;
 }
 
 // GithubProjectEvent is a project-related timeline event on an issue

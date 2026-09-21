@@ -387,6 +387,8 @@ type GitHubIssue struct {
 	projectsSyncedAsOf      time.Time
 	projectEventsSyncedAsOf time.Time
 
+	issueFieldChanges []*GitHubIssueFieldChange // oldest first, as GitHub returns them
+
 	// metaChangedAt is the observation time at which a snapshot-style metadata
 	// change (org-level IssueFields or IssueType) was last detected. GitHub
 	// gives no authoritative change time for these and they don't bump Updated,
@@ -398,7 +400,8 @@ type GitHubIssue struct {
 
 	// IssueFields holds GitHub's org-level "Issue fields" (a distinct feature
 	// from Projects V2 fields) by field name -> display value. nil if the issue
-	// has no fields set (or they have not been synced yet).
+	// has no fields set (or they have not been synced yet). These are the
+	// current values only; see ForeachIssueFieldChange for when they changed.
 	IssueFields map[string]string
 }
 
@@ -649,6 +652,21 @@ type GitHubIssueProjectItem struct {
 	fieldValues map[string]projectFieldValue // field name -> raw value
 }
 
+// GitHubIssueFieldChange is one of the issue's org-level "Issue field" values
+// being replaced by another. The IssueFields map holds only the current values.
+// A change record is what tells you when a value was set and what it replaced.
+//
+// A field's first assignment and its clearing are separate GitHub event types
+// and are not synced. See issueFieldChangesFragment.
+type GitHubIssueFieldChange struct {
+	ID            string
+	FieldName     string
+	PreviousValue string
+	Value         string
+	Actor         *GitHubUser
+	Created       time.Time
+}
+
 // GitHubProjectEvent is a project-related timeline event on an issue.
 type GitHubProjectEvent struct {
 	ID             string
@@ -766,6 +784,17 @@ func (gi *GitHubIssue) ForeachProjectEvent(fn func(*GitHubProjectEvent) error) e
 	})
 	for _, ev := range events {
 		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ForeachIssueFieldChange calls fn for each recorded change to one of the
+// issue's org-level issue field values, oldest first.
+func (gi *GitHubIssue) ForeachIssueFieldChange(fn func(*GitHubIssueFieldChange) error) error {
+	for _, ch := range gi.issueFieldChanges {
+		if err := fn(ch); err != nil {
 			return err
 		}
 	}
@@ -2296,6 +2325,31 @@ func (c *Corpus) processGithubIssueMutation(m *maintpb.GithubIssueMutation) {
 			for _, fv := range m.IssueField {
 				gi.IssueFields[fv.FieldName] = fv.Value
 			}
+		}
+	}
+
+	if m.IssueFieldChangesSynced {
+		// IssueFieldChange is a full snapshot too, so replace wholesale. GitHub
+		// returns the changes oldest first, and the emitting side keeps them in
+		// that order.
+		gi.issueFieldChanges = nil
+		for _, fc := range m.IssueFieldChange {
+			ch := &GitHubIssueFieldChange{
+				ID: fc.Id,
+				// Field names and values repeat across every issue, so intern
+				// them. Node IDs are unique, so interning one would only grow
+				// the table.
+				FieldName:     c.str(fc.FieldName),
+				PreviousValue: c.str(fc.PreviousValue),
+				Value:         c.str(fc.Value),
+			}
+			if fc.ActorId != 0 {
+				ch.Actor = c.github.getOrCreateUserID(fc.ActorId)
+			}
+			if fc.Created != nil {
+				ch.Created = fc.Created.AsTime()
+			}
+			gi.issueFieldChanges = append(gi.issueFieldChanges, ch)
 		}
 	}
 
@@ -5157,7 +5211,41 @@ func (p *githubRepoPoller) syncProjectsForIssue(ctx context.Context, issueNum in
 		}
 	}
 
-	if len(mut.ProjectItem) == 0 && len(mut.RemovedProjectItemId) == 0 && len(mut.ProjectEvent) == 0 && mut.IssueType == "" && !mut.IssueFieldsSynced {
+	// Issue field changes are a snapshot, like the values above. The selection
+	// returns every change on the issue rather than a delta, so the fetched list
+	// replaces whatever the corpus holds. A truncated list would delete the
+	// overflow, so skip the sync instead of persisting one.
+	if issueData.IssueFieldChanges.PageInfo.HasNextPage {
+		p.c.logf("maintner: %s/%s#%d has >100 issue field changes; skipping issue-field-change sync to avoid a truncated snapshot", owner, repo, issueNum)
+	} else {
+		var changes []*maintpb.GithubIssueFieldChange
+		for _, ch := range issueData.IssueFieldChanges.Nodes {
+			if ch.ID == "" || ch.IssueField.Name == "" {
+				continue
+			}
+			fc := &maintpb.GithubIssueFieldChange{
+				Id:            ch.ID,
+				FieldName:     ch.IssueField.Name,
+				PreviousValue: ch.PreviousValue,
+				Value:         ch.NewValue,
+				ActorId:       ch.Actor.DatabaseID,
+			}
+			if !ch.CreatedAt.IsZero() {
+				fc.Created = timestamppb.New(ch.CreatedAt)
+			}
+			changes = append(changes, fc)
+		}
+		p.c.mu.RLock()
+		changed := issueFieldChangesChanged(gi.issueFieldChanges, changes)
+		p.c.mu.RUnlock()
+		if changed {
+			mut.IssueFieldChange = changes
+			mut.IssueFieldChangesSynced = true
+		}
+	}
+
+	if len(mut.ProjectItem) == 0 && len(mut.RemovedProjectItemId) == 0 && len(mut.ProjectEvent) == 0 &&
+		mut.IssueType == "" && !mut.IssueFieldsSynced && !mut.IssueFieldChangesSynced {
 		return nil // nothing changed
 	}
 
@@ -5280,6 +5368,24 @@ func projectFieldsChanged(existing *GitHubProject, gqlFields []gqlProjectField) 
 	return false
 }
 
+// issueFieldChangesChanged reports whether the changes just fetched differ from
+// the ones the corpus already holds, so an unchanged issue doesn't append a
+// mutation on every sync. A change is immutable once GitHub reports it, so
+// comparing node IDs in order is enough. Two changes sharing a timestamp could
+// in principle come back in a different order, which would cost one redundant
+// mutation each time it happened.
+func issueFieldChangesChanged(existing []*GitHubIssueFieldChange, fetched []*maintpb.GithubIssueFieldChange) bool {
+	if len(existing) != len(fetched) {
+		return true
+	}
+	for i, fc := range fetched {
+		if existing[i].ID != fc.Id {
+			return true
+		}
+	}
+	return false
+}
+
 // fieldValuesChanged reports whether the field values from a GraphQL response
 // differ from what's stored on an existing project item in the corpus.
 func fieldValuesChanged(existing *GitHubIssueProjectItem, newVals map[string]*maintpb.GithubProjectItemFieldValue) bool {
@@ -5334,6 +5440,12 @@ type projectIssueData struct {
 		} `json:"pageInfo"`
 		Nodes []gqlIssueFieldValue `json:"nodes"`
 	} `json:"issueFieldValues"`
+	IssueFieldChanges struct {
+		PageInfo struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
+		Nodes []gqlIssueFieldChange `json:"nodes"`
+	} `json:"issueFieldChanges"`
 }
 
 // gqlIssueFieldValue is one org-level issue field value node. The field name is
@@ -5347,6 +5459,20 @@ type gqlIssueFieldValue struct {
 	} `json:"field"`
 	Value       string   `json:"value"`       // single-select/text/date/multi-select display value
 	NumberValue *float64 `json:"numberValue"` // number fields
+}
+
+// gqlIssueFieldChange is one ISSUE_FIELD_CHANGED_EVENT timeline node. As with
+// gqlIssueFieldValue, the field name is flattened out of an interface fragment.
+// See issueFieldChangesFragment.
+type gqlIssueFieldChange struct {
+	ID         string    `json:"id"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Actor      gqlActor  `json:"actor"`
+	IssueField struct {
+		Name string `json:"name"`
+	} `json:"issueField"`
+	PreviousValue string `json:"previousValue"`
+	NewValue      string `json:"newValue"`
 }
 
 type gqlProjectItem struct {
@@ -5571,13 +5697,46 @@ const issueFieldValuesFragment = `
         }
 `
 
+// issueFieldChangesFragment fetches the history behind issueFieldValuesFragment.
+// Each node is one timeline event where an issue field value was replaced by
+// another. The field name comes through the IssueFieldCommon interface, the same
+// way the values do.
+//
+// projectItemsFragment already selects timelineItems for project events, so this
+// selection needs an alias. The two itemTypes lists are disjoint, and the whole
+// query stays at a rate-limit cost of 1.
+//
+// Only ISSUE_FIELD_CHANGED_EVENT is selected. Adding a field value and removing
+// one are separate event types, and together they outnumber the changes by
+// roughly nine to one. Leaving them out keeps most of the traffic and storage out
+// of the corpus. The cost is that a value's first assignment is not dated, and a
+// cleared field looks unchanged.
+//
+// first: 100 is GitHub's max page size, and there is no pagination loop here. The
+// most changes seen on a real issue is 4, so hasNextPage should never be true.
+const issueFieldChangesFragment = `
+        issueFieldChanges: timelineItems(first: 100, itemTypes: [ISSUE_FIELD_CHANGED_EVENT]) {
+          pageInfo { hasNextPage }
+          nodes {
+            ... on IssueFieldChangedEvent {
+              id
+              createdAt
+              previousValue
+              newValue
+              actor { ... on User { databaseId login } }
+              issueField { ... on IssueFieldCommon { name } }
+            }
+          }
+        }
+`
+
 var projectsForIssueQuery = `
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issueOrPullRequest(number: $number) {
       ... on Issue {
         issueType { name }
-` + issueFieldValuesFragment + projectItemsFragment + `
+` + issueFieldValuesFragment + issueFieldChangesFragment + projectItemsFragment + `
       }
       ... on PullRequest {
 ` + projectItemsFragment + `
